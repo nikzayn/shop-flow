@@ -67,7 +67,7 @@ flowchart LR
   AIOPS --> LOKI
 ```
 
-**Services (Python / FastAPI)** — kept small on purpose; the platform is the star, not the business logic.
+**Services (Go, standard library `net/http`)** — kept small on purpose; the platform is the star, not the business logic.
 
 | Service | Responsibility | Interesting platform problem it creates |
 |---|---|---|
@@ -81,7 +81,8 @@ flowchart LR
 
 | Skill | Where you'll use it for real |
 |---|---|
-| **Python** | 5 services, Locust load tests, AIOps anomaly detector + incident bot |
+| **Go** | 5 services (net/http, pgx, go-redis, slog), table-driven tests, race detector |
+| **Python** | Locust load tests, AIOps anomaly detector + incident bot, tooling scripts |
 | **Docker** | Multi-stage, non-root, multi-arch images; compose for local dev |
 | **Kubernetes** | kind (local, simulated 3 AZs) → EKS; probes, PDBs, spread, NetworkPolicy, rollouts |
 | **Helm** | One reusable chart for all services + third-party platform charts |
@@ -143,8 +144,9 @@ flowchart LR
 ```
 service-platform/
 ├── services/                 # catalog, cart, checkout, payment-mock, order-worker
-│   └── <svc>/{app/,tests/,Dockerfile,pyproject.toml}
-├── libs/shopflow-common/     # shared logging, metrics, tracing, config helpers
+│   └── <svc>/{main.go,internal/,db/,Dockerfile}
+├── internal/platform/        # shared Go code: logging, metrics, tracing, health, config
+├── go.mod                    # one Go module for all services (see ADR list)
 ├── deploy/
 │   ├── charts/service/       # ONE generic Helm chart for all services
 │   ├── platform/             # values for argocd, keda, kube-prometheus-stack, loki, tempo, chaos-mesh...
@@ -176,7 +178,7 @@ Go slower rather than skip the drills.
 *Scenario: Day one on the team. Set up a repo that other engineers could join tomorrow.*
 
 - [ ] **SF-001** `git init`, push to GitHub, protect `main` (PR required, checks required).
-- [ ] **SF-002** `pre-commit` with ruff, yamllint, `terraform fmt`, gitleaks. `Makefile` with `help`, `lint`, `test`.
+- [ ] **SF-002** `pre-commit` with golangci-lint, yamllint, `terraform fmt`, gitleaks. `Makefile` with `help`, `lint`, `test`.
 - [ ] **SF-003** `docs/adr/0001-record-architecture-decisions.md` using the MADR template. ADR-0002: monorepo vs polyrepo.
 - [ ] **SF-004** Install tooling: `uv`, `ansible`, `k9s`, `kubectx`, `trivy`, `tflint`, `kubeconform`, `argocd`, `pre-commit`.
 - [ ] **SF-005** AWS account hygiene: MFA on root then stop using root, IAM Identity Center (or an admin user with MFA),
@@ -201,9 +203,9 @@ Go slower rather than skip the drills.
   - Write the order **and** an outbox row in **one transaction**; a relay publishes outbox rows to SQS.
 - [ ] **SF-104** `payment-mock`: admin endpoint to set latency, error rate, and a "silent failure" mode (returns 200 but declines).
 - [ ] **SF-105** `order-worker`: long-poll SQS, process idempotently, delete on success; DLQ after 5 receives.
-- [ ] **SF-106** Cross-cutting (put in `libs/shopflow-common`): `/healthz` (liveness) vs `/readyz` (dependencies),
-  JSON logs with `trace_id`, Prometheus `/metrics`, OpenTelemetry auto-instrumentation, graceful SIGTERM, config from env vars only.
-- [ ] **SF-107** Tests: pytest unit tests + one concurrency test. Local SQS via LocalStack.
+- [ ] **SF-106** Cross-cutting (put in `internal/platform`): `/healthz` (liveness) vs `/readyz` (dependencies),
+  JSON logs with `trace_id`, Prometheus `/metrics`, OpenTelemetry instrumentation (`otelhttp`, `otelpgx`), graceful SIGTERM, config from env vars only.
+- [ ] **SF-107** Tests: table-driven `go test` unit tests, run with `-race`, + one concurrency test. Local SQS via LocalStack.
 
 **Acceptance:**
 - 50 concurrent checkouts on a SKU with stock 10 → **exactly 10 succeed**, stock = 0, never negative.
@@ -220,10 +222,10 @@ Go slower rather than skip the drills.
 
 *Scenario: Security review flagged the old images: 1.2 GB, running as root, 40 critical CVEs.*
 
-- [ ] **SF-201** Multi-stage Dockerfile per service: slim base, locked deps, non-root user, `.dockerignore`.
+- [ ] **SF-201** Multi-stage Dockerfile per service: static Go binary (`CGO_ENABLED=0`) → `distroless/static:nonroot`, build cache mounts, `.dockerignore`.
 - [ ] **SF-202** Multi-arch builds (`linux/amd64,linux/arm64`) with `docker buildx`.
 - [ ] **SF-203** `docker-compose.yml`: all services + Postgres + Redis + LocalStack, with healthcheck-based `depends_on`.
-- [ ] **SF-204** Trivy scan: zero CRITICAL. Image size < 150 MB.
+- [ ] **SF-204** Trivy + `govulncheck`: zero CRITICAL. Image size < 25 MB.
 
 **Acceptance:** `docker compose up` → a Locust smoke test places 100 orders; worker processes all 100.
 
@@ -295,7 +297,7 @@ Go slower rather than skip the drills.
 
 *Scenario: Last year's mid-sale hotfix made things worse. Deploys must be boring, auditable, and self-reverting.*
 
-- [ ] **SF-601** GitHub Actions, path-filtered per service: ruff → pytest → buildx (with cache) → Trivy → SBOM (syft) → cosign keyless sign → push to GHCR. Tags = git SHA, never `latest`.
+- [ ] **SF-601** GitHub Actions, path-filtered per service: golangci-lint → `go test -race` → buildx (with cache) → Trivy → SBOM (syft) → cosign keyless sign → push to GHCR. Tags = git SHA, never `latest`.
 - [ ] **SF-602** Chart CI: `helm lint`, `helm template | kubeconform`.
 - [ ] **SF-603** Argo CD in kind: ApplicationSet for services + app-of-apps for platform components. CI bumps the image tag via PR; Argo CD syncs.
 - [ ] **SF-604** **Argo Rollouts** canary for `checkout`: 10% → 30% → 60% → 100% with an `AnalysisTemplate` on Prometheus error ratio and p95.
@@ -424,6 +426,9 @@ Go slower rather than skip the drills.
 | 0010 | Where Ansible fits in a Kubernetes-first platform |
 | 0011 | Single NAT (dev) vs NAT per AZ (prod): cost vs availability |
 | 0012 | Guardrails for AIOps auto-remediation |
+| 0013 | Private repo without server-side branch protection |
+| 0014 | Go for services (Python kept for load tests and AIOps) |
+| 0015 | One Go module for all services vs one module per service |
 
 ## 10. Progress log
 

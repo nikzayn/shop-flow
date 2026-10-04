@@ -1,1 +1,5 @@
-./aws
+.aws/
+bin/
+.env
+.venv
+*.test
