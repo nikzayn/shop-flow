@@ -3,3 +3,4 @@ bin/
 .env
 .venv
 *.test
+.env.example
