@@ -30,16 +30,16 @@ services:
       dockerfile: services/catalog/Dockerfile
     image: shopflow/catalog:dev
     environment:
-      DATABASE_URL: postgres://shopflow:${POSTGRES_PASSWORD}@postgres:5432/catalog?sslmode=disable
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
       REDIS_URL: redis://redis:6379/
       CACHE_TTL: 5m
     ports:
       - "8080:8080"
     depends_on:
       postgres:
-        condition: service_started
+        condition: service_healthy
       redis:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
